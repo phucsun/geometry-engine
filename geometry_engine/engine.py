@@ -42,15 +42,21 @@ from .topology import TopologyBuilder
 from .validator import ConstraintValidator
 from .normalizer import Normalizer
 from .utils import (
+    angle_bisector_foot,
+    are_parallel,
     are_perpendicular,
     centroid,
+    circumcenter,
+    circumscribed_sphere_center,
     cosine_of_angle,
     dist,
     equilateral_apex_candidates,
+    incenter,
     intersect_line_plane,
     intersect_two_lines,
     midpoint,
     normalize,
+    orthocenter,
     perpendicular_pair,
     plane_from_points,
     polygon_normal,
@@ -167,6 +173,7 @@ class GeometryEngine:
             # ── Shape anchors ─────────────────────────────────────────────
             "square":                self._handle_square,
             "rectangle":             self._handle_rectangle,
+            "parallelogram":         self._handle_parallelogram,
             "rhombus":               self._handle_rhombus,
             "trapezoid":             self._handle_trapezoid,
             "equilateral_triangle":  self._handle_equilateral_triangle,
@@ -178,10 +185,18 @@ class GeometryEngine:
             "prism":                 self._handle_prism,
             "regular_hexagon":       self._handle_regular_hexagon,
             "regular_octahedron":    self._handle_regular_octahedron,
+            "regular_polygon":       self._handle_regular_polygon,
+            "right_prism":           self._handle_right_prism,
             # ── Derived points ────────────────────────────────────────────
             "midpoint":              self._handle_midpoint,
             "ratio_point":           self._handle_ratio_point,
             "centroid":              self._handle_centroid,
+            "circumcenter":          self._handle_circumcenter,
+            "orthocenter":           self._handle_orthocenter,
+            "incenter":              self._handle_incenter,
+            "equidistant":           self._handle_equidistant,
+            "angle_bisector":        self._handle_angle_bisector,
+            "median":                self._handle_median,
             "foot_perpendicular":    self._handle_foot_perpendicular,
             "foot_on_plane":         self._handle_foot_on_plane,
             "perpendicular_to_plane":self._handle_perpendicular_to_plane,
@@ -197,8 +212,10 @@ class GeometryEngine:
             "distance":              self._handle_distance,
             "edge_length":           self._handle_edge_length,
             "on_line":               self._handle_on_line,
+            "collinear":             self._handle_collinear,
             "parallel":              lambda _c: True,
             "perpendicular":         lambda _c: True,
+            "coplanar":              lambda _c: True,
         }
         if ctype not in m:
             logger.warning("Unknown constraint '%s' — skipped.", ctype)
@@ -229,6 +246,47 @@ class GeometryEngine:
             perp = self._planar_perp(ab) * s
             self.coords[C] = self.coords[B] + perp
             self.coords[D] = self.coords[A] + perp
+            return True
+        return False
+
+    def _handle_parallelogram(self, c: Constraint) -> bool:
+        """
+        Hình bình hành ABCD: AB ∥ DC, AD ∥ BC → C = B + D − A.
+        Nếu chưa đặt điểm nào: A ở gốc, B dọc trục x, D ở góc 60°.
+        Tham số: length (AB), width (AD), degrees (góc DAB, mặc định 60°).
+        """
+        pts = c.points or []
+        if len(pts) != 4:
+            raise SolverError("'parallelogram' needs 4 points")
+        A, B, C, D = pts
+        if all(p in self.coords for p in pts):
+            return True
+
+        # Trường hợp chưa đặt điểm nào: tạo hình bình hành từ đầu
+        if not any(p in self.coords for p in pts):
+            ab = c.length or self._side_length
+            ad = c.width  or self._side_length
+            deg = c.degrees if c.degrees is not None else 60.0
+            angle = np.radians(deg)
+            self.coords[A] = np.array([0.,              0.,                    0.])
+            self.coords[B] = np.array([ab,              0.,                    0.])
+            self.coords[D] = np.array([ad * np.cos(angle), ad * np.sin(angle), 0.])
+            self.coords[C] = self.coords[B] + self.coords[D] - self.coords[A]
+            return True
+
+        # Tính điểm còn lại từ 3 điểm đã biết (C = B + D − A, v.v.)
+        known = {p for p in pts if p in self.coords}
+        if {A, B, D} <= known and C not in self.coords:
+            self.coords[C] = self.coords[B] + self.coords[D] - self.coords[A]
+            return True
+        if {A, B, C} <= known and D not in self.coords:
+            self.coords[D] = self.coords[A] + self.coords[C] - self.coords[B]
+            return True
+        if {A, C, D} <= known and B not in self.coords:
+            self.coords[B] = self.coords[A] + self.coords[C] - self.coords[D]
+            return True
+        if {B, C, D} <= known and A not in self.coords:
+            self.coords[A] = self.coords[B] + self.coords[D] - self.coords[C]
             return True
         return False
 
@@ -449,6 +507,60 @@ class GeometryEngine:
         self.coords[E4] = np.array([ 0., -s,   0.])
         return True
 
+    def _handle_regular_polygon(self, c: Constraint) -> bool:
+        """
+        Đa giác đều n cạnh nằm trong mặt XY.
+        Circumradius R = side_length / (2 * sin(π/n)).
+        """
+        pts = c.points or []
+        n = len(pts)
+        if n < 3:
+            raise SolverError("'regular_polygon' needs at least 3 points")
+        if any(p in self.coords for p in pts):
+            return True
+        s = self._side_length
+        R = s / (2.0 * np.sin(np.pi / n))
+        for i, name in enumerate(pts):
+            angle = 2.0 * np.pi * i / n
+            self.coords[name] = np.array([R * np.cos(angle), R * np.sin(angle), 0.0])
+        return True
+
+    def _handle_right_prism(self, c: Constraint) -> bool:
+        """
+        Lăng trụ đứng n-giác.
+        points = [A1, A2, …, An, B1, B2, …, Bn] (2n points).
+        Đáy dưới = đa giác n cạnh, đỉnh trên = tịnh tiến theo pháp tuyến đáy.
+        height = chiều cao (default side_length).
+        """
+        pts = c.points or []
+        if len(pts) < 4 or len(pts) % 2 != 0:
+            raise SolverError("'right_prism' needs 2n points (n ≥ 2)")
+        n = len(pts) // 2
+        base_names = pts[:n]
+        top_names  = pts[n:]
+
+        if all(p in self.coords for p in pts):
+            return True
+
+        # Place base if not yet placed
+        if not any(p in self.coords for p in base_names):
+            s = self._side_length
+            R = s / (2.0 * np.sin(np.pi / n))
+            for i, name in enumerate(base_names):
+                angle = 2.0 * np.pi * i / n
+                self.coords[name] = np.array([R * np.cos(angle), R * np.sin(angle), 0.0])
+        elif not all(p in self.coords for p in base_names):
+            return False  # base partially placed — wait
+
+        # Place top from base
+        base_positions = [self.coords[p] for p in base_names]
+        _, normal = plane_from_points(base_positions)
+        h = c.height if c.height is not None else self._side_length
+        for i, name in enumerate(top_names):
+            if name not in self.coords:
+                self.coords[name] = base_positions[i] + h * normal
+        return True
+
     # ═══════════════════════════════════════════════════════════════════════
     # DERIVED POINTS
     # ═══════════════════════════════════════════════════════════════════════
@@ -495,6 +607,119 @@ class GeometryEngine:
         if not all(p in self.coords for p in ref):
             return False
         self.coords[G] = centroid([self.coords[p] for p in ref])
+        return True
+
+    def _handle_circumcenter(self, c: Constraint) -> bool:
+        """
+        Tâm đường tròn ngoại tiếp tam giác.
+        point=O, points=[A, B, C].
+        """
+        O = c.point
+        pts = c.points or []
+        if not O or len(pts) != 3:
+            raise SolverError("'circumcenter' needs 'point' and 'points=[A,B,C]'")
+        if O in self.coords:
+            return True
+        if not all(p in self.coords for p in pts):
+            return False
+        A, B, C = (self.coords[p] for p in pts)
+        self.coords[O] = circumcenter(A, B, C)
+        return True
+
+    def _handle_orthocenter(self, c: Constraint) -> bool:
+        """
+        Trực tâm tam giác.
+        point=H, points=[A, B, C].
+        """
+        H = c.point
+        pts = c.points or []
+        if not H or len(pts) != 3:
+            raise SolverError("'orthocenter' needs 'point' and 'points=[A,B,C]'")
+        if H in self.coords:
+            return True
+        if not all(p in self.coords for p in pts):
+            return False
+        A, B, C = (self.coords[p] for p in pts)
+        self.coords[H] = orthocenter(A, B, C)
+        return True
+
+    def _handle_incenter(self, c: Constraint) -> bool:
+        """
+        Tâm đường tròn nội tiếp tam giác.
+        point=I, points=[A, B, C].
+        """
+        I = c.point
+        pts = c.points or []
+        if not I or len(pts) != 3:
+            raise SolverError("'incenter' needs 'point' and 'points=[A,B,C]'")
+        if I in self.coords:
+            return True
+        if not all(p in self.coords for p in pts):
+            return False
+        A, B, C = (self.coords[p] for p in pts)
+        self.coords[I] = incenter(A, B, C)
+        return True
+
+    def _handle_equidistant(self, c: Constraint) -> bool:
+        """
+        Điểm cách đều n điểm đã biết — tâm mặt cầu ngoại tiếp.
+        point=O, points=[A, B, C, D, …].
+        Dùng least-squares để xác định O.
+        """
+        O = c.point
+        pts = c.points or []
+        if not O or len(pts) < 2:
+            raise SolverError("'equidistant' needs 'point' and at least 2 'points'")
+        if O in self.coords:
+            return True
+        if not all(p in self.coords for p in pts):
+            return False
+        positions = [self.coords[p] for p in pts]
+        center = circumscribed_sphere_center(positions)
+        if center is None:
+            logger.warning("equidistant: underdetermined for %s", pts)
+            return False
+        self.coords[O] = center
+        return True
+
+    def _handle_angle_bisector(self, c: Constraint) -> bool:
+        """
+        Chân đường phân giác từ đỉnh giữa xuống cạnh đối diện.
+        point=D, points=[A, B, C]:
+          B là đỉnh có góc cần phân giác, D là chân trên AC.
+          AD/DC = |AB|/|BC|  (định lý phân giác).
+        """
+        D = c.point
+        pts = c.points or []
+        if not D or len(pts) != 3:
+            raise SolverError("'angle_bisector' needs 'point' and 'points=[A,B,C]'")
+        if D in self.coords:
+            return True
+        A_n, B_n, C_n = pts
+        if not all(p in self.coords for p in pts):
+            return False
+        self.coords[D] = angle_bisector_foot(
+            self.coords[A_n], self.coords[B_n], self.coords[C_n]
+        )
+        return True
+
+    def _handle_median(self, c: Constraint) -> bool:
+        """
+        Trung điểm cạnh đối diện — chân đường trung tuyến.
+        point=M, points=[A, B, C]:
+          M là trung điểm BC (cạnh đối diện với A).
+        Tương đương midpoint với segment=[B,C].
+        """
+        M = c.point
+        pts = c.points or []
+        if not M or len(pts) != 3:
+            raise SolverError("'median' needs 'point' and 'points=[A,B,C]'")
+        if M in self.coords:
+            return True
+        _, B_n, C_n = pts
+        if B_n not in self.coords or C_n not in self.coords:
+            return False
+        self.coords[M] = midpoint(self.coords[B_n], self.coords[C_n])
         return True
 
     def _handle_foot_perpendicular(self, c: Constraint) -> bool:
@@ -795,6 +1020,54 @@ class GeometryEngine:
         if c.length is not None and not self.coords:
             self._side_length = c.length
         return True
+
+    def _handle_collinear(self, c: Constraint) -> bool:
+        """
+        Ba điểm thẳng hàng. points=[A, B, C].
+
+        Nếu A và B đã biết nhưng C chưa biết:
+          - Nếu C có candidates → lọc những candidate nằm trên đường AB.
+          - Nếu C không có candidates → đặt C = A + side_length * normalize(B-A).
+        Nếu cả ba đã biết → kiểm tra passthrough (True).
+        """
+        pts = c.points or []
+        if len(pts) < 3:
+            return False
+        A_n, B_n, C_n = pts[0], pts[1], pts[2]
+        if all(p in self.coords for p in pts):
+            return True
+
+        # Tìm cặp (known_pair, unknown)
+        for unknown, ref1, ref2 in [
+            (C_n, A_n, B_n), (A_n, B_n, C_n), (B_n, A_n, C_n)
+        ]:
+            if unknown in self.coords:
+                continue
+            if ref1 not in self.coords or ref2 not in self.coords:
+                continue
+            R1, R2 = self.coords[ref1], self.coords[ref2]
+            direction = R2 - R1
+            if np.linalg.norm(direction) < 1e-12:
+                continue
+
+            if unknown in self._candidates:
+                # Lọc candidates nằm trên đường thẳng qua R1, R2
+                filtered = [
+                    cand for cand in self._candidates[unknown]
+                    if np.linalg.norm(np.cross(cand - R1, direction)) < 1e-5
+                ]
+                if filtered:
+                    if len(filtered) == 1:
+                        self.coords[unknown] = filtered[0]
+                        del self._candidates[unknown]
+                    else:
+                        self._candidates[unknown] = filtered
+                    return True
+            else:
+                # Đặt điểm trên đường tại khoảng cách side_length từ ref1
+                self.coords[unknown] = R1 + self._side_length * normalize(direction)
+                return True
+        return False
 
     def _handle_on_line(self, c: Constraint) -> bool:
         """

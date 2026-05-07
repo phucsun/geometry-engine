@@ -208,3 +208,93 @@ def plane_from_points(positions: list[np.ndarray]) -> tuple[np.ndarray, np.ndarr
     c = centroid(positions)
     n = polygon_normal(positions)
     return c, n
+
+
+# ── Triangle special points ───────────────────────────────────────────────────
+
+def circumcenter(A: np.ndarray, B: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """
+    Circumcenter of triangle ABC (tâm đường tròn ngoại tiếp).
+    |OA| = |OB| = |OC|  and  O lies in plane(A,B,C).
+    Uses the linear system derived from |OA|² = |OB|² = |OC|².
+    """
+    AB = B - A
+    AC = C - A
+    normal = np.cross(AB, AC)
+    if np.linalg.norm(normal) < 1e-10:
+        return (A + B + C) / 3.0  # degenerate: collinear → return centroid
+    M = np.array([2.0 * AB, 2.0 * AC, normal])
+    b = np.array([
+        float(np.dot(B, B) - np.dot(A, A)),
+        float(np.dot(C, C) - np.dot(A, A)),
+        float(np.dot(normal, A)),
+    ])
+    return np.linalg.solve(M, b)
+
+
+def orthocenter(A: np.ndarray, B: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """
+    Orthocenter of triangle ABC (trực tâm).
+    AH ⊥ BC  and  BH ⊥ AC  and  H lies in plane(A,B,C).
+    """
+    BC = C - B
+    AC = C - A
+    AB = B - A
+    normal = np.cross(AB, AC)
+    if np.linalg.norm(normal) < 1e-10:
+        return (A + B + C) / 3.0
+    M = np.array([BC, AC, normal])
+    b = np.array([
+        float(np.dot(A, BC)),
+        float(np.dot(B, AC)),
+        float(np.dot(A, normal)),
+    ])
+    return np.linalg.solve(M, b)
+
+
+def incenter(A: np.ndarray, B: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """
+    Incenter of triangle ABC (tâm đường tròn nội tiếp).
+    Weighted average of vertices: weights = opposite side lengths.
+    """
+    a = float(np.linalg.norm(C - B))  # side opposite A
+    b = float(np.linalg.norm(C - A))  # side opposite B
+    c = float(np.linalg.norm(B - A))  # side opposite C
+    denom = a + b + c
+    if denom < 1e-12:
+        return (A + B + C) / 3.0
+    return (a * A + b * B + c * C) / denom
+
+
+def circumscribed_sphere_center(points: list[np.ndarray]) -> np.ndarray | None:
+    """
+    Center of the circumscribed sphere through all given points (tâm mặt cầu ngoại tiếp).
+    Solves least-squares: 2*(Pi - P0)·O = |Pi|² - |P0|²  for all i≥1.
+    Returns None if underdetermined (fewer than 2 points).
+    """
+    if len(points) < 2:
+        return None
+    P0 = points[0]
+    rows = [2.0 * (P - P0) for P in points[1:]]
+    rhs  = [float(np.dot(P, P) - np.dot(P0, P0)) for P in points[1:]]
+    M = np.array(rows)      # (n-1) × 3
+    b = np.array(rhs)
+    O, _, rank, _ = np.linalg.lstsq(M, b, rcond=None)
+    if rank < min(M.shape):
+        return None
+    return O
+
+
+def angle_bisector_foot(A: np.ndarray, B: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """
+    Foot of the angle bisector from vertex B onto side AC (chân đường phân giác từ B).
+    By the angle-bisector theorem: D divides AC in ratio AB:BC.
+    D = A + t*(C-A)  where  t = |AB| / (|AB| + |BC|).
+    """
+    AB = float(np.linalg.norm(B - A))
+    BC = float(np.linalg.norm(C - B))
+    denom = AB + BC
+    if denom < 1e-12:
+        return (A + C) / 2.0
+    t = AB / denom
+    return A + t * (C - A)

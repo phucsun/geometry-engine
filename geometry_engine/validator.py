@@ -10,7 +10,17 @@ from __future__ import annotations
 import numpy as np
 
 from .models import Constraint
-from .utils import dist, are_perpendicular, polygon_normal, plane_from_points, normalize
+from .utils import (
+    circumcenter,
+    circumscribed_sphere_center,
+    dist,
+    are_perpendicular,
+    incenter,
+    orthocenter,
+    plane_from_points,
+    polygon_normal,
+    normalize,
+)
 
 
 _TOL = 1e-5   # absolute tolerance for geometric checks
@@ -43,15 +53,15 @@ class ConstraintValidator:
         checker = {
             "square":                self._chk_square,
             "rectangle":             self._chk_quad_sides,
+            "parallelogram":         self._chk_parallelogram,
             "rhombus":               self._chk_rhombus,
             "equilateral_triangle":  self._chk_equilateral,
             "right_angle":           self._chk_right_angle,
             "midpoint":              self._chk_midpoint,
             "ratio_point":           self._chk_ratio_point,
             "regular_tetrahedron":   self._chk_regular_tetrahedron,
-            "apex":                  self._chk_apex_equidistant,
             "regular_pyramid":       self._chk_apex_equidistant,
-            "pyramid":               self._chk_apex_equidistant,
+            # "apex" và "pyramid" không yêu cầu equidistant (chóp không nhất thiết đều)
             "centroid":              self._chk_centroid,
             "perpendicular_to_plane": self._chk_perpendicular_to_plane,
             "angle":                 self._chk_angle,
@@ -59,7 +69,15 @@ class ConstraintValidator:
             "foot_perpendicular":    self._chk_foot_perpendicular,
             "foot_on_plane":         self._chk_foot_on_plane,
             "regular_hexagon":       self._chk_regular_polygon,
+            "regular_polygon":       self._chk_regular_polygon,
             "regular_octahedron":    self._chk_regular_octahedron,
+            "circumcenter":          self._chk_circumcenter,
+            "orthocenter":           self._chk_orthocenter,
+            "incenter":              self._chk_incenter,
+            "equidistant":           self._chk_equidistant,
+            "angle_bisector":        self._chk_angle_bisector,
+            "median":                self._chk_median,
+            "collinear":             self._chk_collinear,
         }.get(c.type)
         return checker(c) if checker else None
 
@@ -108,6 +126,20 @@ class ConstraintValidator:
         # For rectangle: opposite sides equal
         if not (abs(sides[0] - sides[2]) < self.tol and abs(sides[1] - sides[3]) < self.tol):
             return f"rectangle {pts}: opposite sides not equal {[round(x,6) for x in sides]}"
+        return None
+
+    def _chk_parallelogram(self, c: Constraint) -> str | None:
+        """AB = DC (vector): B-A == C-D."""
+        pts = c.points or []
+        pos = self._get(*pts)
+        if pos is None or len(pos) != 4:
+            return None
+        A, B, C, D = pos
+        AB = B - A
+        DC = C - D
+        err = float(np.linalg.norm(AB - DC))
+        if err > self.tol:
+            return f"parallelogram {pts}: AB ≠ DC (err={err:.6f})"
         return None
 
     def _chk_rhombus(self, c: Constraint) -> str | None:
@@ -358,6 +390,125 @@ class ConstraintValidator:
         s = edges[0]
         if not all(abs(e - s) < self.tol for e in edges):
             return f"regular_octahedron {pts}: edges not equal"
+        return None
+
+    def _chk_circumcenter(self, c: Constraint) -> str | None:
+        O = c.point
+        pts = c.points or []
+        if not O or len(pts) != 3:
+            return None
+        pos = self._get(O, *pts)
+        if pos is None:
+            return None
+        O_pos = pos[0]
+        dists = [dist(O_pos, p) for p in pos[1:]]
+        if not all(abs(d - dists[0]) < self.tol for d in dists):
+            return f"circumcenter {O}: distances not equal {[round(d,6) for d in dists]}"
+        return None
+
+    def _chk_orthocenter(self, c: Constraint) -> str | None:
+        H = c.point
+        pts = c.points or []
+        if not H or len(pts) != 3:
+            return None
+        pos = self._get(H, *pts)
+        if pos is None:
+            return None
+        H_pos, A, B, C = pos
+        AH, BC = H_pos - A, C - B
+        BH, AC = H_pos - B, C - A
+        if abs(float(np.dot(AH, BC))) > self.tol:
+            return f"orthocenter {H}: AH not ⊥ BC (dot={np.dot(AH,BC):.4f})"
+        if abs(float(np.dot(BH, AC))) > self.tol:
+            return f"orthocenter {H}: BH not ⊥ AC (dot={np.dot(BH,AC):.4f})"
+        return None
+
+    def _chk_incenter(self, c: Constraint) -> str | None:
+        I = c.point
+        pts = c.points or []
+        if not I or len(pts) != 3:
+            return None
+        pos = self._get(I, *pts)
+        if pos is None:
+            return None
+        I_pos, A, B, C = pos
+        expected = incenter(A, B, C)
+        err = dist(I_pos, expected)
+        if err > self.tol:
+            return f"incenter {I}: error = {err:.6f}"
+        return None
+
+    def _chk_equidistant(self, c: Constraint) -> str | None:
+        O = c.point
+        pts = c.points or []
+        if not O or len(pts) < 2:
+            return None
+        pos = self._get(O, *pts)
+        if pos is None:
+            return None
+        O_pos = pos[0]
+        dists = [dist(O_pos, p) for p in pos[1:]]
+        if not all(abs(d - dists[0]) < self.tol for d in dists):
+            return f"equidistant {O}: distances not equal {[round(d,6) for d in dists]}"
+        return None
+
+    def _chk_angle_bisector(self, c: Constraint) -> str | None:
+        D = c.point
+        pts = c.points or []
+        if not D or len(pts) != 3:
+            return None
+        A_n, B_n, C_n = pts
+        pos = self._get(D, A_n, B_n, C_n)
+        if pos is None:
+            return None
+        D_pos, A, B, C = pos
+        # D should lie on segment AC
+        AC = C - A
+        if np.linalg.norm(AC) < 1e-10:
+            return None
+        # Check D is on line AC
+        if np.linalg.norm(np.cross(D_pos - A, AC)) > self.tol:
+            return f"angle_bisector {D}: not on line AC"
+        # Check BD bisects angle ABC: angle(ABD) == angle(DBC)
+        BD = D_pos - B
+        BA, BC_v = A - B, C - B
+        cos1 = float(np.clip(np.dot(BD, BA) / (np.linalg.norm(BD) * np.linalg.norm(BA) + 1e-30), -1, 1))
+        cos2 = float(np.clip(np.dot(BD, BC_v) / (np.linalg.norm(BD) * np.linalg.norm(BC_v) + 1e-30), -1, 1))
+        if abs(cos1 - cos2) > 1e-4:
+            return f"angle_bisector {D}: BD does not bisect angle B"
+        return None
+
+    def _chk_median(self, c: Constraint) -> str | None:
+        M = c.point
+        pts = c.points or []
+        if not M or len(pts) != 3:
+            return None
+        _, B_n, C_n = pts
+        pos = self._get(M, B_n, C_n)
+        if pos is None:
+            return None
+        M_pos, B, C = pos
+        expected = (B + C) / 2.0
+        err = dist(M_pos, expected)
+        if err > self.tol:
+            return f"median {M}: error = {err:.6f}"
+        return None
+
+    def _chk_collinear(self, c: Constraint) -> str | None:
+        pts = c.points or []
+        if len(pts) < 3:
+            return None
+        pos = self._get(*pts)
+        if pos is None:
+            return None
+        A, B = pos[0], pos[1]
+        AB = B - A
+        if np.linalg.norm(AB) < 1e-10:
+            return None
+        for i, P in enumerate(pos[2:], 2):
+            cross = np.linalg.norm(np.cross(P - A, AB))
+            if cross > self.tol:
+                return f"collinear {pts}: {pts[i]} not on line {pts[0]}{pts[1]} (cross={cross:.4f})"
         return None
 
     def _chk_apex_equidistant(self, c: Constraint) -> str | None:

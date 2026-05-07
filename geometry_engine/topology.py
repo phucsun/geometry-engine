@@ -38,6 +38,7 @@ class TopologyBuilder:
         handler = {
             "square":                self._topo_quad,
             "rectangle":             self._topo_quad,
+            "parallelogram":         self._topo_quad,
             "rhombus":               self._topo_quad,
             "trapezoid":             self._topo_quad,
             "equilateral_triangle":  self._topo_triangle,
@@ -53,6 +54,8 @@ class TopologyBuilder:
             "regular_hexagon":       self._topo_hexagon,
             "regular_octahedron":    self._topo_octahedron,
             "truncated_pyramid":     self._topo_truncated_pyramid,
+            "regular_polygon":       self._topo_regular_polygon,
+            "right_prism":           self._topo_right_prism,
         }.get(constraint.type)
         if handler:
             handler(constraint)
@@ -221,6 +224,40 @@ class TopologyBuilder:
             self._add_edge(top[i], top[(i + 1) % n])
         self._add_face(list(top))
         # Lateral edges and quad faces
+        for i in range(n):
+            self._add_edge(base[i], top[i])
+            self._add_face([base[i], base[(i + 1) % n], top[(i + 1) % n], top[i]])
+
+    def _topo_regular_polygon(self, c: Constraint) -> None:
+        """Đa giác đều n cạnh: n cạnh + 1 mặt n-giác."""
+        pts = c.points or []
+        n = len(pts)
+        if n < 3:
+            return
+        for i in range(n):
+            self._add_edge(pts[i], pts[(i + 1) % n])
+        self._add_face(list(pts))
+
+    def _topo_right_prism(self, c: Constraint) -> None:
+        """
+        Lăng trụ đứng n-giác: 3n cạnh, n+2 mặt (2 n-giác + n tứ giác).
+        points = [A1..An, B1..Bn].
+        """
+        pts = c.points or []
+        if len(pts) < 4 or len(pts) % 2 != 0:
+            return
+        n = len(pts) // 2
+        base = pts[:n]
+        top  = pts[n:]
+        # Đáy dưới
+        for i in range(n):
+            self._add_edge(base[i], base[(i + 1) % n])
+        self._add_face(list(base))
+        # Đáy trên
+        for i in range(n):
+            self._add_edge(top[i], top[(i + 1) % n])
+        self._add_face(list(top))
+        # Cạnh bên + mặt bên
         for i in range(n):
             self._add_edge(base[i], top[i])
             self._add_face([base[i], base[(i + 1) % n], top[(i + 1) % n], top[i]])
