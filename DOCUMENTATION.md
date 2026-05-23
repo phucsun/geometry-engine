@@ -1,110 +1,76 @@
 # GeometryEngine — Tài liệu kỹ thuật
 
-> **Vị trí trong hệ thống:** OCR → LLM → **GeometryEngine** → Unity AR  
-> Nhận JSON ràng buộc từ LLM, giải toạ độ 3D, trả về điểm + cạnh + mặt cho Unity render.
+## 1. Tổng quan
 
----
+Project hiện tại gồm ba lớp rõ ràng:
 
-## Mục lục
+- `ocr_llm`: đọc ảnh, OCR, prompt LLM, repair payload thành `GeometryInput`
+- `backend_pipeline`: orchestration cho luồng ảnh
+- `geometry_engine`: deterministic solver sinh `GeometryOutput`
 
-1. [Tổng quan kiến trúc](#1-tổng-quan-kiến-trúc)
-2. [Cấu trúc thư mục](#2-cấu-trúc-thư-mục)
-3. [Input / Output Schema](#3-input--output-schema)
-4. [Các constraint được hỗ trợ](#4-các-constraint-được-hỗ-trợ)
-5. [Thuật toán giải](#5-thuật-toán-giải)
-6. [Các kỹ thuật toán học](#6-các-kỹ-thuật-toán-học)
-7. [Pipeline xử lý sau khi giải](#7-pipeline-xử-lý-sau-khi-giải)
-8. [API Server](#8-api-server)
-9. [CLI](#9-cli)
-10. [Test Suite](#10-test-suite)
-11. [Ví dụ end-to-end](#11-ví-dụ-end-to-end)
+Hai luồng vào chính:
 
----
+```text
+Structured input
+Client -> POST /solve -> GeometryEngine -> GeometryOutput
 
-## 1. Tổng quan kiến trúc
-
-```
-┌─────────────┐   ảnh đề toán   ┌─────────┐   văn bản   ┌─────────┐
-│  Mobile App │ ─────────────▶  │   OCR   │ ──────────▶ │   LLM   │
-└─────────────┘                 └─────────┘             └────┬────┘
-                                                             │ GeometryInput JSON
-                                                             ▼
-                                                   ┌─────────────────┐
-                                                   │  GeometryEngine │
-                                                   │  (Python)       │
-                                                   └────────┬────────┘
-                                                            │ GeometryOutput JSON
-                                                            │ (points + edges + faces)
-                                                            ▼
-                                                   ┌─────────────────┐
-                                                   │   Unity AR App  │
-                                                   │ LineRenderer    │
-                                                   │ Mesh            │
-                                                   └─────────────────┘
+Image input
+Client -> POST /solve-image -> backend_pipeline -> ocr_llm -> GeometryEngine -> GeometryOutput
 ```
 
-**GeometryEngine** là một HTTP microservice (FastAPI). Unity gọi `POST /solve`, nhận JSON với toạ độ 3D của mọi điểm, danh sách cạnh và danh sách mặt để render.
+Mục tiêu của việc tách lớp:
 
----
+- OCR/LLM xử lý phần ngôn ngữ mơ hồ
+- solver xử lý phần hình học xác định và kiểm chứng được
+- API chỉ là HTTP wrapper, không chứa logic giải
 
-## 2. Cấu trúc thư mục
+## 2. Kiến trúc module
 
-```
-GeometryEngine/
+```text
+geometry_engine/
 ├── geometry_engine/
-│   ├── __init__.py          # Export GeometryEngine, GeometryInput
-│   ├── __main__.py          # CLI entry point
-│   ├── models.py            # Pydantic I/O schemas
-│   ├── engine.py            # Solver chính — constraint propagation
-│   ├── topology.py          # Sinh edges + faces từ constraint
-│   ├── validator.py         # Kiểm tra toạ độ đã giải có thoả mãn constraint không
-│   ├── normalizer.py        # Chuẩn hoá về origin, scale về unit sphere
-│   └── utils.py             # Thư viện vector 3D (numpy)
-├── server.py                # FastAPI app
-├── tests/
-│   ├── conftest.py
-│   ├── test_engine.py       # 56 tests — core solving
-│   ├── test_topology.py     # 18 tests — edges/faces
-│   ├── test_server.py       # 11 tests — HTTP API
-│   └── test_advanced.py     # 24 tests — constraint types mới
-└── requirements.txt
+│   ├── handlers/              # grouped handlers theo family
+│   ├── __init__.py            # public Python API exports
+│   ├── __main__.py            # CLI: solve / validate / serve
+│   ├── engine.py              # fixed-point solver
+│   ├── errors.py              # SolverError
+│   ├── models.py              # GeometryInput / GeometryOutput
+│   ├── normalizer.py          # normalize output
+│   ├── registry.py            # constraint type -> handler
+│   ├── topology.py            # edges / faces
+│   ├── utils.py               # vector math
+│   └── validator.py           # hậu kiểm constraint
+├── ocr_llm/
+│   ├── analyzer.py            # OCR + LLM + validation entrypoints
+│   ├── problem_types.py       # detect family từ đề bài
+│   ├── prompts/               # prompt template + rule snippets
+│   └── repairs/               # sửa payload LLM trước khi validate
+├── backend_pipeline.py        # image -> GeometryOutput
+├── server.py                  # FastAPI routes
+├── math_problem_image/        # ảnh mẫu để test
+└── tests/
 ```
 
-### Vai trò từng module
+Vai trò từng khối:
 
-| Module | Trách nhiệm |
-|--------|------------|
-| `models.py` | Định nghĩa `GeometryInput` / `GeometryOutput` bằng Pydantic v2 |
-| `engine.py` | Vòng lặp constraint propagation, sinh toạ độ 3D |
-| `topology.py` | Map constraint type → danh sách Edge + Face |
-| `validator.py` | Kiểm tra hậu kỳ: mỗi constraint có thoả mãn không |
-| `normalizer.py` | Center về gốc toạ độ, scale về unit sphere để Unity AR nhất quán |
-| `utils.py` | Tất cả phép tính vector: chuẩn hoá, chiếu, phản chiếu, giao điểm |
-| `server.py` | FastAPI wrapper, `POST /solve`, `GET /health` |
-| `__main__.py` | CLI: `solve`, `validate`, `serve` |
+- `geometry_engine` không hiểu tiếng Việt hay OCR; nó chỉ nhận `GeometryInput`
+- `ocr_llm` không gọi solver; nó chỉ xuất `GeometryInput`
+- `backend_pipeline` là chỗ nối hai khối đó
+- `server.py` đưa public API ra HTTP
 
----
+## 3. Public interfaces
 
-## 3. Input / Output Schema
+### 3.1 `GeometryInput`
 
-### GeometryInput
+Schema được định nghĩa trong `geometry_engine/models.py`.
 
 ```json
 {
   "points": ["A", "B", "C", "D", "S"],
   "constraints": [
-    {
-      "type": "square",
-      "points": ["A", "B", "C", "D"]
-    },
-    {
-      "type": "right_angle",
-      "points": ["S", "A", "B"]
-    },
-    {
-      "type": "right_angle",
-      "points": ["S", "A", "D"]
-    }
+    { "type": "square", "points": ["A", "B", "C", "D"] },
+    { "type": "right_angle", "points": ["S", "A", "B"] },
+    { "type": "right_angle", "points": ["S", "A", "D"] }
   ],
   "side_length": 2.0,
   "normalize": false,
@@ -112,522 +78,318 @@ GeometryEngine/
 }
 ```
 
-**Tham số của `Constraint`:**
+Các field của `Constraint` hiện có:
 
-| Trường | Kiểu | Dùng bởi |
-|--------|------|----------|
-| `type` | `str` | tất cả |
-| `points` | `list[str]` | hình học đa giác, right_angle, angle, distance |
-| `point` | `str` | điểm kết quả của midpoint, centroid, intersection… |
-| `segment` | `list[str]` | cặp điểm [A, B] cho midpoint, foot_perpendicular, intersection |
-| `from_point` | `str` | điểm xuất phát cho foot_on_plane, symmetric, perpendicular_to_plane |
-| `length` | `float` | chiều dài / kích thước x |
-| `width` | `float` | kích thước y (rectangle, prism) |
-| `height` | `float` | kích thước z (prism, truncated_pyramid) |
-| `ratio` | `float` | tỉ lệ [0,1] cho ratio_point hoặc truncated_pyramid |
-| `degrees` | `float` | góc (độ) cho constraint `angle` |
+| Field | Meaning |
+|------|---------|
+| `type` | loại constraint |
+| `points` | danh sách điểm theo thứ tự có nghĩa |
+| `point` | điểm kết quả |
+| `segment` | đoạn thẳng hai điểm |
+| `from_point` | điểm xuất phát |
+| `length` | độ dài / kích thước chính |
+| `width` | kích thước phụ |
+| `height` | chiều cao |
+| `ratio` | tỉ lệ |
+| `degrees` | góc theo độ |
 
-### GeometryOutput
+### 3.2 `GeometryOutput`
 
 ```json
 {
   "points": {
-    "A": {"x": 0.0, "y": 0.0, "z": 0.0},
-    "B": {"x": 2.0, "y": 0.0, "z": 0.0},
-    "S": {"x": 0.0, "y": 0.0, "z": 2.0}
+    "A": {"x": 0.0, "y": 0.0, "z": 0.0}
   },
-  "edges": [
-    {"p1": "A", "p2": "B"},
-    {"p1": "A", "p2": "S"}
-  ],
-  "faces": [
-    {"vertices": ["A", "B", "C", "D"]}
-  ],
+  "edges": [],
+  "faces": [],
   "unresolved_points": [],
   "violations": []
 }
 ```
 
----
+Ý nghĩa:
 
-## 4. Các constraint được hỗ trợ
+- `points`: toạ độ 3D đã giải được
+- `edges`: cạnh cấu trúc cho render
+- `faces`: mặt polygon cho render mesh
+- `unresolved_points`: điểm không giải ra được
+- `violations`: constraint không thoả sau hậu kiểm
 
-### 4.1 Hình phẳng (Shape anchors — tự đặt toạ độ)
+## 4. API hiện tại
 
-| Constraint | Số điểm | Mô tả | Tham số thêm |
-|-----------|---------|-------|-------------|
-| `square` | 4 | Hình vuông trong mặt XY | `side_length` |
-| `rectangle` | 4 | Hình chữ nhật | `length`, `width` |
-| `rhombus` | 4 | Hình thoi (góc 60°) | `side_length` |
-| `trapezoid` | 4 | Hình thang (AB ∥ DC) | `length`, `width`, `height` |
-| `equilateral_triangle` | 3 | Tam giác đều | `side_length` |
-| `isosceles_triangle` | 3 | Tam giác cân | `length` (chiều cao) |
-| `right_triangle` | 3 | Tam giác vuông | — |
-| `regular_hexagon` | 6 | Lục giác đều trong XY | `side_length` |
+### `GET /health`
 
-### 4.2 Khối 3D (3D solids)
+Trả:
 
-| Constraint | Số điểm | Mô tả | Tham số thêm |
-|-----------|---------|-------|-------------|
-| `regular_tetrahedron` | 4 | Tứ diện đều | `side_length` |
-| `cube` | 8 | Hình lập phương | `side_length` |
-| `rectangular_prism` | 8 | Hình hộp chữ nhật | `length`, `width`, `height` |
-| `prism` | 6 | Lăng trụ tam giác đều | `height` |
-| `regular_octahedron` | 6 | Bát diện đều | `side_length` |
-
-### 4.3 Điểm phái sinh (Derived points — cần điểm trước)
-
-| Constraint | Đầu vào | Kết quả |
-|-----------|---------|---------|
-| `midpoint` | `segment=[A,B]`, `point=M` | M = (A+B)/2 |
-| `ratio_point` | `segment=[A,B]`, `point=G`, `ratio=t` | G = A + t·(B−A) |
-| `centroid` | `points=[A,B,C,…]`, `point=G` | G = trung bình các điểm |
-| `foot_perpendicular` | `from_point=S`, `segment=[A,B]`, `point=H` | H = hình chiếu S lên AB |
-| `foot_on_plane` | `from_point=S`, `points=[A,B,C,…]`, `point=H` | H = hình chiếu S lên mặt phẳng |
-| `perpendicular_to_plane` | `from_point=A`, `points=[A,B,C,…]`, `point=S`, `length=h` | S = A + h·n̂ (n̂ là pháp tuyến mặt phẳng) |
-| `symmetric` | `from_point=P`, `points=[M]`, `point=P'` | Đối xứng qua điểm M |
-| `symmetric` | `from_point=P`, `points=[A,B]`, `point=P'` | Đối xứng qua đường AB |
-| `symmetric` | `from_point=P`, `points=[A,B,C,…]`, `point=P'` | Đối xứng qua mặt phẳng ABC |
-| `intersection` | `segment=[A,B]`, `points=[C,D]`, `point=I` | Giao điểm hai đường thẳng |
-| `intersection` | `segment=[A,B]`, `points=[C,D,E,…]`, `point=I` | Giao điểm đường AB với mặt phẳng CDE |
-| `apex` / `regular_pyramid` / `pyramid` | `points=[S,A,B,C,D]` | S = tâm đáy + h·pháp tuyến |
-| `truncated_pyramid` | `points=[A,B,…,A',B',…]`, `ratio`, `height` | Hình chóp cụt (N đáy + N đỉnh) |
-
-### 4.4 Ràng buộc lọc / định vị (Filters)
-
-| Constraint | Vai trò |
-|-----------|---------|
-| `right_angle` | `points=[arm1, vertex, arm2]`: lọc candidates theo vuông góc |
-| `angle` | `points=[arm1, vertex, arm2]`, `degrees=θ`: lọc candidates theo góc cụ thể |
-| `distance` | `points=[P,Q]`, `length=L`: lọc candidates theo khoảng cách, hoặc cập nhật `side_length` |
-| `edge_length` | Cập nhật `side_length` mặc định |
-| `on_line` | Đánh dấu điểm nằm trên đường (cần constraint khác để định vị chính xác) |
-| `parallel` | Ghi nhận (hiện là passthrough) |
-| `perpendicular` | Ghi nhận (hiện là passthrough) |
-
----
-
-## 5. Thuật toán giải
-
-Engine sử dụng **constraint propagation** (lan truyền ràng buộc) theo mô hình fixed-point:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Input: danh sách constraints, coords = {}, candidates = {} │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-              ┌───────────────▼───────────────┐
-              │  _one_pass(pending)            │  ◀─────────────┐
-              │  Thử từng handler:             │                │
-              │  • True  → đã giải, bỏ khỏi   │                │
-              │    pending                     │                │
-              │  • False → thiếu tiền đề, giữ │                │
-              │    lại                         │                │
-              └───────────────┬───────────────┘                │
-                              │                                 │
-                    progress? ├── Có ──────────────────────────┘
-                              │
-                              │ Không
-                              ▼
-              ┌───────────────────────────────┐
-              │  _try_perpendicular_system()  │
-              │  Phát hiện mẫu SA⊥(ABCD) qua │
-              │  nhiều right_angle → sinh     │
-              │  candidates cho đỉnh S        │
-              └───────────────┬───────────────┘
-                              │
-                    progress? ├── Có ──────────────────────────┘ (quay lại one_pass)
-                              │
-                              │ Không
-                              ▼
-              ┌───────────────────────────────┐
-              │  _commit_one_candidate()      │
-              │  Chọn candidate tốt nhất      │
-              │  (heuristic: z cao nhất)      │
-              └───────────────┬───────────────┘
-                              │
-                    Không còn candidates → kết thúc
-```
-
-### 5.1 Candidate list (danh sách ứng viên)
-
-Nhiều điểm không có vị trí duy nhất từ một constraint đơn lẻ. Engine lưu **danh sách ứng viên** (`_candidates`), sau đó dùng các constraint lọc để thu hẹp:
-
-```
-equilateral_triangle [S, A, B]  →  4 ứng viên (4 hướng ⊥ AB)
-right_angle [S, A, D]           →  lọc còn 2 ứng viên
-right_angle [S, A, B] (lần 2)  →  lọc còn 1 → commit
-```
-
-Nếu vẫn còn nhiều candidates sau tất cả filters → **z-priority heuristic**: chọn điểm có z lớn nhất (apex ở trên đáy).
-
-### 5.2 Multi-right-angle perpendicular solver
-
-Đây là kỹ thuật then chốt xử lý bài toán phổ biến nhất trong hình học không gian THPT Việt Nam: **SA ⊥ (ABCD)**.
-
-Bài toán thường được LLM phân tích thành:
-```
-right_angle [S, A, B]   →  SA ⊥ AB
-right_angle [S, A, D]   →  SA ⊥ AD
-```
-
-Engine phát hiện mẫu này qua `_try_perpendicular_system()`:
-
-```python
-# Nhóm các right_angle có cùng (điểm_chưa_biết, đỉnh)
-groups[(S, A)] = [B, D]   # S chưa biết, A đã biết, B và D đã biết
-
-# Tính pháp tuyến của mặt phẳng qua AB × AD
-normal = normalize(cross(AB, AD))
-
-# Sinh 2 candidates: S = A ± h * normal
-candidates[S] = [A + h*normal, A - h*normal]
-```
-
-Sau đó z-priority chọn điểm phía trên (z dương) → S đúng vị trí.
-
----
-
-## 6. Các kỹ thuật toán học
-
-Tất cả tính toán sử dụng **numpy float64**, không dùng sympy (ưu tiên tốc độ).
-
-### 6.1 Cơ sở trực giao (Orthonormal basis)
-
-```python
-def perpendicular_pair(u):
-    # Cho vector u, sinh (v, w) sao cho {u, v, w} là cơ sở trực giao phải
-    ref = [1,0,0] nếu |u[0]| < 0.9 else [0,1,0]
-    v = normalize(cross(u, ref))
-    w = cross(u, v)   # đã là unit vì u ⊥ v
-    return v, w
-```
-
-Dùng để sinh candidates vuông góc với một vector đã biết (equilateral_triangle, isosceles_triangle, perpendicular_to_plane).
-
-### 6.2 Hình chiếu điểm lên đường thẳng
-
-```python
-def project_point_onto_line(P, A, B):
-    t = dot(P-A, B-A) / dot(B-A, B-A)
-    return A + t * (B-A)
-```
-
-Dùng bởi: `foot_perpendicular`, `reflect_over_line`.
-
-### 6.3 Hình chiếu điểm lên mặt phẳng
-
-```python
-def project_point_onto_plane(P, plane_pt, normal):
-    n = normalize(normal)
-    return P - dot(P - plane_pt, n) * n
-```
-
-Dùng bởi: `foot_on_plane`, `reflect_over_plane`.
-
-### 6.4 Giao điểm hai đường thẳng trong 3D (Least Squares)
-
-Hai đường thẳng trong 3D thường **chéo nhau** (không cắt nhau). Engine dùng least-squares để tìm điểm gần nhất:
-
-```
-Giải: [d1 | -d2] [t; s] = C - A  (ma trận 3×2)
-→ dùng np.linalg.lstsq
-Nếu |P1 - P2| < tol → trả về (P1+P2)/2
-Nếu không → trả về None (đường chéo)
-```
-
-### 6.5 Giao điểm đường thẳng và mặt phẳng
-
-```python
-def intersect_line_plane(P, direction, plane_pt, plane_normal):
-    denom = dot(direction, plane_normal)
-    if |denom| < 1e-12: return None   # song song
-    t = dot(plane_pt - P, plane_normal) / denom
-    return P + t * direction
-```
-
-### 6.6 Pháp tuyến đa giác — Phương pháp Newell
-
-```python
-for i in range(n):
-    cur, nxt = positions[i], positions[(i+1) % n]
-    normal[0] += (cur[1] - nxt[1]) * (cur[2] + nxt[2])
-    normal[1] += (cur[2] - nxt[2]) * (cur[0] + nxt[0])
-    normal[2] += (cur[0] - nxt[0]) * (cur[1] + nxt[1])
-```
-
-Ưu điểm: ổn định số học với đa giác lồi bất kỳ, không cần chọn 3 điểm cụ thể.  
-Bias về +z: nếu normal[2] < 0 thì đảo dấu → pháp tuyến luôn hướng lên.
-
-### 6.7 Phản chiếu (Reflection)
-
-| Phản chiếu qua | Công thức |
-|---------------|-----------|
-| Điểm M | P' = 2M − P |
-| Đường AB | P' = 2·foot(P→AB) − P |
-| Mặt phẳng | P' = 2·foot(P→plane) − P |
-
-### 6.8 Kiểm tra song song / vuông góc
-
-```python
-def are_perpendicular(v1, v2, tol=1e-6):
-    return |dot(v1,v2)| / (|v1| * |v2|) < tol
-
-def are_parallel(v1, v2, tol=1e-6):
-    return |cross(v1/|v1|, v2/|v2|)| < tol
-```
-
----
-
-## 7. Pipeline xử lý sau khi giải
-
-```
-Toạ độ đã giải
-      │
-      ▼
-┌─────────────────┐
-│  TopologyBuilder │  → edges (LineRenderer) + faces (Mesh)
-└────────┬────────┘
-         │
-         ▼
-┌──────────────────────┐
-│  ConstraintValidator │  → violations: list[str]
-└────────┬─────────────┘
-         │
-         ▼
-┌────────────────┐
-│   Normalizer   │  (nếu normalize=True)
-│  center→origin │
-│  scale→unit    │
-└────────────────┘
-         │
-         ▼
-   GeometryOutput
-```
-
-### TopologyBuilder
-
-Mỗi constraint type biết nó đóng góp bao nhiêu cạnh và mặt:
-
-| Shape | Cạnh | Mặt |
-|-------|------|-----|
-| triangle | 3 | 1 tam giác |
-| square/rectangle/rhombus/trapezoid | 4 | 1 tứ giác |
-| regular_hexagon | 6 | 1 lục giác |
-| cube/rectangular_prism | 12 | 6 tứ giác |
-| prism | 9 | 5 (2 tam giác + 3 tứ giác) |
-| regular_tetrahedron | 6 | 4 tam giác |
-| regular_octahedron | 12 | 8 tam giác |
-| pyramid (N đáy) | N+N | N+1 (đáy + N tam giác) |
-| truncated_pyramid (N đáy) | N+N+N | N+2 (đáy + đỉnh + N tứ giác) |
-
-**Deduplication:** Cạnh lưu theo `(min(p1,p2), max(p1,p2))` dạng set. Mặt lưu theo `frozenset(vertices)` → tránh trùng khi nhiều constraint cùng tạo ra một mặt (ví dụ: square + pyramid cùng tạo mặt đáy ABCD).
-
-### ConstraintValidator
-
-Sau khi giải xong, validator kiểm tra từng constraint bằng toán học:
-
-- **square**: 4 cạnh bằng nhau + 4 góc = 90°
-- **equilateral_triangle**: 3 cạnh bằng nhau
-- **right_angle**: dot product của hai vector = 0
-- **midpoint**: |M - (A+B)/2| < tol
-- **centroid**: |G - mean(A,B,C,…)| < tol
-- **perpendicular_to_plane**: SA × normal ≈ 0
-- **symmetric**: |P' - expected_reflection| < tol
-- **regular_octahedron**: 12 cạnh bằng nhau
-- v.v.
-
-Kết quả violations trả về trong `GeometryOutput.violations: list[str]`.
-
----
-
-## 8. API Server
-
-### Khởi động
-
-```bash
-# Trực tiếp
-uvicorn server:app --host 0.0.0.0 --port 8000 --reload
-
-# Qua CLI
-python -m geometry_engine serve --host 0.0.0.0 --port 8000 --reload
-```
-
-### Endpoints
-
-#### `GET /health`
 ```json
 {"status": "ok", "version": "1.0.0"}
 ```
 
-#### `POST /solve`
+### `POST /solve`
 
-**Request:** `Content-Type: application/json`, body là `GeometryInput`
+- content type: `application/json`
+- body: `GeometryInput`
+- response: `GeometryOutput`
 
-**Response:** `GeometryOutput`
+Use case:
+
+- client đã có JSON có cấu trúc
+- test solver trực tiếp
+- bypass toàn bộ OCR/LLM
+
+### `POST /solve-image`
+
+- content type: `multipart/form-data`
+- field bắt buộc: `image`
+- response: `GeometryOutput`
+
+Flow nội bộ:
+
+1. FastAPI nhận `UploadFile`
+2. validate `content_type` phải là `image/*`
+3. từ chối file rỗng
+4. ghi file tạm
+5. gọi `backend_pipeline.solve_image(path)`
+6. xoá file tạm trong `finally`
+
+Error contract hiện tại:
+
+- `400`: file không phải ảnh hoặc file rỗng
+- `422`: pipeline OCR/LLM/solver ném lỗi nghiệp vụ
+- `500`: lỗi không mong đợi
+
+Swagger:
+
+- [http://localhost:8000/docs](http://localhost:8000/docs)
+- [http://localhost:8000/redoc](http://localhost:8000/redoc)
+
+## 5. CLI hiện tại
+
+`geometry_engine/__main__.py` export 3 lệnh:
 
 ```bash
-curl -X POST http://localhost:8000/solve \
-  -H "Content-Type: application/json" \
-  -d '{
-    "points": ["A","B","C","D","S"],
-    "constraints": [
-      {"type": "square", "points": ["A","B","C","D"]},
-      {"type": "right_angle", "points": ["S","A","B"]},
-      {"type": "right_angle", "points": ["S","A","D"]}
-    ],
-    "side_length": 2.0
-  }'
-```
-
-**Swagger UI:** `http://localhost:8000/docs`  
-**ReDoc:** `http://localhost:8000/redoc`
-
----
-
-## 9. CLI
-
-```bash
-# Giải từ file
 python -m geometry_engine solve problem.json --pretty
-
-# Giải từ stdin
-echo '{"points":["A","B","C"],"constraints":[...],"side_length":1}' | \
-  python -m geometry_engine solve
-
-# Chỉ validate (kiểm tra vi phạm, không in toạ độ)
 python -m geometry_engine validate problem.json
-
-# Khởi động server
-python -m geometry_engine serve --port 8000 --reload
+python -m geometry_engine serve --host 0.0.0.0 --port 8000 --reload
 ```
 
-Exit code `1` nếu có violations.
-
----
-
-## 10. Test Suite
+Luồng ảnh hiện có CLI riêng qua `backend_pipeline.py`:
 
 ```bash
-# Chạy tất cả (99 tests)
-pytest tests/ -v
-
-# Chỉ một file
-pytest tests/test_engine.py -v
-
-# Với coverage
-pytest tests/ --cov=geometry_engine --cov-report=term-missing
+python backend_pipeline.py math_problem_image/math_prob.jpg --pretty
 ```
 
-### Phân bổ tests
+## 6. Solver architecture
 
-| File | Số tests | Nội dung |
-|------|---------|----------|
-| `test_engine.py` | 46 | Toạ độ, constraint solving, full pyramid example |
-| `test_topology.py` | 18 | Đếm cạnh + mặt cho từng shape |
-| `test_server.py` | 11 | HTTP API, status codes, response schema |
-| `test_advanced.py` | 24 | Constraint types mới, SA⊥(ABCD) pattern |
-| **Tổng** | **99** | **99/99 passed** |
+`GeometryEngine.solve(...)` trong `engine.py` chạy theo fixed-point loop:
 
----
+1. reset state `coords`, `candidates`, `side_length`
+2. lặp qua `pending constraints`
+3. mỗi constraint được dispatch qua `registry.get_handler(...)`
+4. handler:
+   - trả `True` nếu đã tạo progress
+   - trả `False` nếu chưa đủ tiền đề
+5. khi loop bị stall:
+   - thử `_try_perpendicular_system(...)`
+   - thử `_try_equilateral_right_angle_system(...)`
+   - nếu vẫn chưa tiến triển, commit một candidate
+6. sau cùng:
+   - commit toàn bộ candidate còn lại
+   - build topology
+   - validate constraints nếu bật cờ
+   - normalize output nếu bật cờ
 
-## 11. Ví dụ end-to-end
+Các nhóm handler hiện có:
 
-### Bài toán điển hình: Chóp S.ABCD với SA ⊥ (ABCD)
+- `BaseShapeHandlers`
+- `SolidShapeHandlers`
+- `DerivedPointHandlers`
+- `SpecialRuleHandlers`
+- `ConstraintHandlers`
 
-**Đề bài:** Hình vuông ABCD cạnh 2. SA ⊥ (ABCD), SA = 2. Tìm toạ độ các đỉnh.
+Registry hiện map các nhóm constraint sau:
 
-**LLM sinh ra JSON:**
+- 2D anchors:
+  - `square`, `rectangle`, `parallelogram`, `rhombus`, `trapezoid`
+  - `equilateral_triangle`, `isosceles_triangle`, `right_triangle`
+  - `regular_hexagon`, `regular_polygon`
+- 3D solids / prism / pyramid:
+  - `regular_tetrahedron`, `cube`, `rectangular_prism`, `prism`
+  - `oblique_prism`, `right_prism`, `regular_octahedron`
+  - `apex`, `regular_pyramid`, `pyramid`, `truncated_pyramid`
+- derived points:
+  - `midpoint`, `ratio_point`, `centroid`, `circumcenter`, `orthocenter`
+  - `incenter`, `equidistant`, `angle_bisector`, `median`
+  - `foot_perpendicular`, `foot_on_plane`, `perpendicular_to_plane`
+  - `symmetric`, `intersection`
+- filter / disambiguation:
+  - `right_angle`, `angle`, `distance`, `edge_length`, `on_line`, `collinear`
+- passthrough:
+  - `parallel`, `perpendicular`, `coplanar`
+
+Backend-only constraints do OCR repair sinh ra:
+
+- `dihedral_angle`
+- `equal_side_face_angle`
+
+## 7. OCR/LLM preprocessing
+
+`ocr_llm/analyzer.py` là entrypoint chính:
+
+- `run_ocr(image_path) -> str`
+- `analyze_problem_text(problem_text) -> GeometryInput`
+- `analyze_image(image_path) -> tuple[str, GeometryInput]`
+
+### 7.1 Problem type detection
+
+`ocr_llm/problem_types.py` hiện có các family:
+
+- `square_pyramid`
+- `dihedral_pyramid`
+- `equal_side_face_angle_pyramid`
+- `right_triangular_prism`
+- `oblique_triangular_prism`
+- `generic_shapes`
+
+Việc detect là local, regex-based, không gọi model.
+
+### 7.2 Prompt scoping
+
+Prompt builder chỉ đưa vào:
+
+- family hiện tại
+- subset constraint nên ưu tiên
+- rule snippets cho family đó
+- một ví dụ gần nhất
+
+Mục tiêu là thu hẹp không gian trả lời của LLM, không để model tự phát minh format.
+
+### 7.3 Payload repair
+
+Sau khi LLM trả payload, project luôn chạy repair trước khi `GeometryInput.model_validate(...)`.
+
+Các repair hiện có:
+
+- chuẩn hoá giá trị symbolic: `a`, `2a`, `a/2`, `a√3`
+- sửa field placement cho `centroid`, `intersection`, `perpendicular_to_plane`
+- thêm `apex` hoặc `parallelogram` nếu đề chóp có nhưng payload thiếu
+- đổi góc giữa hai mặt phẳng thành `dihedral_angle`
+- đổi cụm “các mặt bên cùng tạo với mặt đáy góc ...” thành `equal_side_face_angle`
+- gom dữ kiện lăng trụ đứng thành `right_prism`
+- gom dữ kiện lăng trụ xiên thành `oblique_prism`
+- reorder constraints để solver xử lý thuận hơn
+
+Điểm quan trọng:
+
+- `ocr_llm` chịu trách nhiệm semantic cleanup
+- `geometry_engine` giả định input đã là schema sạch
+
+## 8. Backend image pipeline
+
+`backend_pipeline.py` là orchestration layer:
+
+```text
+image -> analyze_image -> GeometryInput -> GeometryEngine.solve -> GeometryOutput
+```
+
+Các entrypoint:
+
+- `solve_image(path) -> GeometryOutput`
+- `solve_image_json(path, pretty=False) -> str`
+- CLI `python backend_pipeline.py image.png --pretty`
+
+Pipeline này là nơi thích hợp để test end-to-end ngoài HTTP server.
+
+## 9. Examples
+
+### 9.1 Structured solve
+
 ```json
 {
-  "points": ["A", "B", "C", "D", "S"],
+  "points": ["A", "B", "C", "D"],
   "constraints": [
-    {"type": "square",      "points": ["A","B","C","D"], "length": 2.0},
-    {"type": "right_angle", "points": ["S","A","B"]},
-    {"type": "right_angle", "points": ["S","A","D"]},
-    {"type": "distance",    "points": ["S","A"], "length": 2.0}
+    {"type": "square", "points": ["A", "B", "C", "D"]}
   ],
   "side_length": 2.0
 }
 ```
 
-**Quá trình giải:**
-1. `square` → đặt A=(0,0,0), B=(2,0,0), C=(2,2,0), D=(0,2,0)
-2. `right_angle [S,A,B]` + `right_angle [S,A,D]` → `_try_perpendicular_system()`:
-   - AB = (2,0,0), AD = (0,2,0)
-   - normal = normalize(AB × AD) = (0,0,1)
-   - candidates[S] = [A+(0,0,1), A-(0,0,1)] = [(0,0,1), (0,0,-1)]
-3. `distance [S,A]=2` → scale candidates → S=(0,0,2)
-4. z-priority → chọn S=(0,0,2)
+Kỳ vọng:
 
-**Kết quả:**
-```json
-{
-  "points": {
-    "A": {"x": 0.0, "y": 0.0, "z": 0.0},
-    "B": {"x": 2.0, "y": 0.0, "z": 0.0},
-    "C": {"x": 2.0, "y": 2.0, "z": 0.0},
-    "D": {"x": 0.0, "y": 2.0, "z": 0.0},
-    "S": {"x": 0.0, "y": 0.0, "z": 2.0}
-  },
-  "edges": [
-    {"p1": "A", "p2": "B"}, {"p1": "B", "p2": "C"},
-    {"p1": "C", "p2": "D"}, {"p1": "D", "p2": "A"},
-    {"p1": "S", "p2": "A"}, {"p1": "S", "p2": "B"},
-    {"p1": "S", "p2": "C"}, {"p1": "S", "p2": "D"}
-  ],
-  "faces": [
-    {"vertices": ["A","B","C","D"]},
-    {"vertices": ["S","A","B"]},
-    {"vertices": ["S","B","C"]},
-    {"vertices": ["S","C","D"]},
-    {"vertices": ["S","D","A"]}
-  ],
-  "unresolved_points": [],
-  "violations": []
-}
+- solver đặt 4 điểm trên mặt phẳng `z = 0`
+- sinh 4 cạnh, 1 mặt
+- không có `violations`
+
+### 9.2 Image solve
+
+```bash
+curl -X POST "http://localhost:8000/solve-image" \
+  -H "accept: application/json" \
+  -F "image=@math_problem_image/math_prob.jpg;type=image/jpeg"
 ```
 
-### Bài toán tam giác đều trong không gian
+Kết quả trả về vẫn là `GeometryOutput`, không lộ `ocr_text` hay `GeometryInput`.
 
-```json
-{
-  "points": ["A", "B", "C", "G"],
-  "constraints": [
-    {"type": "equilateral_triangle", "points": ["A","B","C"]},
-    {"type": "centroid", "point": "G", "points": ["A","B","C"]}
-  ],
-  "side_length": 1.0
-}
+## 10. Dependencies
+
+Runtime dependencies hiện tại:
+
+- `numpy>=1.26`
+- `pydantic>=2.0`
+- `fastapi>=0.110`
+- `uvicorn[standard]>=0.29`
+- `httpx>=0.27`
+- `python-multipart>=0.0.9`
+- `langchain-core>=0.2`
+- `langchain-groq>=0.1`
+- `python-dotenv>=1.0`
+
+Test / tooling:
+
+- `pytest>=7.4`
+- `pytest-cov>=4.1`
+
+Lưu ý vận hành:
+
+- `POST /solve-image` và `backend_pipeline.py` cần `GROQ_API_KEY`
+- test server có thể bị skip nếu môi trường chưa cài `fastapi`
+
+## 11. Trạng thái test hiện tại
+
+Trong môi trường kiểm tra gần nhất của repo:
+
+```bash
+pytest tests -q
 ```
 
-### Hình hộp chữ nhật với điểm trung điểm
+Kết quả:
 
-```json
-{
-  "points": ["A","B","C","D","A1","B1","C1","D1","M"],
-  "constraints": [
-    {
-      "type": "rectangular_prism",
-      "points": ["A","B","C","D","A1","B1","C1","D1"],
-      "length": 3.0, "width": 2.0, "height": 4.0
-    },
-    {"type": "midpoint", "point": "M", "segment": ["A","C1"]}
-  ]
-}
+```text
+151 passed, 17 skipped
 ```
 
----
+Các nhóm test đang có:
 
-## Phụ lục: Dependencies
+- core engine
+- topology
+- advanced geometry cases
+- OCR/LLM extraction và repair
+- backend image pipeline
+- problem type detection
+- FastAPI server
 
-```
-numpy>=1.26      # vector math (float64)
-pydantic>=2.0    # I/O validation
-fastapi>=0.110   # HTTP server
-uvicorn>=0.29    # ASGI runner
-pytest>=7.4      # test framework
-pytest-cov>=4.1  # coverage
-httpx>=0.27      # test HTTP client
-sympy>=1.12      # (reserved, chưa dùng)
-```
+## 12. Ranh giới trách nhiệm
+
+Nếu bạn cần sửa project này, nên giữ ranh giới sau:
+
+- thay đổi OCR/prompt/repair: sửa trong `ocr_llm`
+- thay đổi logic nối ảnh -> solver: sửa trong `backend_pipeline.py`
+- thay đổi public API HTTP: sửa trong `server.py`
+- thay đổi suy luận toạ độ hoặc constraint semantics: sửa trong `geometry_engine`
+
+Không đẩy logic solver vào prompt LLM. Project hiện được tách như vậy để:
+
+- dễ test
+- deterministic hơn
+- validate được
+- không phụ thuộc model cho phần suy luận hình học thuần

@@ -48,6 +48,7 @@ class TopologyBuilder:
             "cube":                  self._topo_cube,
             "rectangular_prism":     self._topo_cube,
             "prism":                 self._topo_prism,
+            "oblique_prism":         self._topo_prism,
             "apex":                  self._topo_pyramid,
             "regular_pyramid":       self._topo_pyramid,
             "pyramid":               self._topo_pyramid,

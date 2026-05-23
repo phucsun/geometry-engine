@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import pytest
+from geometry_engine.models import GeometryOutput, Point3D
 
 try:
     from fastapi.testclient import TestClient
@@ -100,3 +101,84 @@ class TestSolveEndpoint:
         cx = sum(pts[n]["x"] for n in "ABCD") / 4
         cy = sum(pts[n]["y"] for n in "ABCD") / 4
         assert abs(cx) < 1e-6 and abs(cy) < 1e-6
+
+
+class TestSolveImageEndpoint:
+    def test_image_upload_returns_200(self, client, monkeypatch):
+        called = {}
+
+        def fake_solve_image(path):
+            called["path"] = path
+            return GeometryOutput(
+                points={"A": Point3D(x=0.0, y=0.0, z=0.0)},
+                edges=[],
+                faces=[],
+                unresolved_points=[],
+                violations=[],
+            )
+
+        monkeypatch.setattr("server.backend_pipeline.solve_image", fake_solve_image)
+
+        resp = client.post(
+            "/solve-image",
+            files={"image": ("problem.png", b"fake-image-bytes", "image/png")},
+        )
+
+        assert resp.status_code == 200
+        assert "path" in called
+
+    def test_image_upload_has_geometry_output_shape(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "server.backend_pipeline.solve_image",
+            lambda _path: GeometryOutput(
+                points={"A": Point3D(x=1.0, y=2.0, z=3.0)},
+                edges=[],
+                faces=[],
+                unresolved_points=[],
+                violations=[],
+            ),
+        )
+
+        resp = client.post(
+            "/solve-image",
+            files={"image": ("problem.png", b"fake-image-bytes", "image/png")},
+        )
+
+        body = resp.json()
+        assert resp.status_code == 200
+        assert set(body.keys()) == {"points", "edges", "faces", "unresolved_points", "violations"}
+        assert set(body["points"]["A"].keys()) == {"x", "y", "z"}
+
+    def test_image_field_is_required(self, client):
+        resp = client.post("/solve-image", files={})
+        assert resp.status_code == 422
+
+    def test_empty_image_returns_400(self, client):
+        resp = client.post(
+            "/solve-image",
+            files={"image": ("problem.png", b"", "image/png")},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "Uploaded image is empty."
+
+    def test_non_image_upload_returns_400(self, client):
+        resp = client.post(
+            "/solve-image",
+            files={"image": ("problem.txt", b"not-an-image", "text/plain")},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "Uploaded file must be an image."
+
+    def test_pipeline_error_returns_422(self, client, monkeypatch):
+        def fake_solve_image(_path):
+            raise RuntimeError("ocr failed")
+
+        monkeypatch.setattr("server.backend_pipeline.solve_image", fake_solve_image)
+
+        resp = client.post(
+            "/solve-image",
+            files={"image": ("problem.png", b"fake-image-bytes", "image/png")},
+        )
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "ocr failed"
