@@ -2,7 +2,7 @@
 FastAPI server for the GeometryEngine.
 
 Pipeline position:
-    Mobile App  →  POST /solve  →  AI Server  →  GeometryOutput JSON  →  Mobile App
+    Mobile App  →  POST /solve or POST /solve-image  →  AI Server  →  GeometryOutput JSON
 
 Run:
     uvicorn server:app --host 0.0.0.0 --port 8000 --reload
@@ -12,7 +12,14 @@ Or via CLI:
 """
 from __future__ import annotations
 
+import mimetypes
+from pathlib import Path
+import tempfile
+import os
+
+import backend_pipeline
 from fastapi import FastAPI, HTTPException, Request
+from fastapi import File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
@@ -27,8 +34,8 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="GeometryEngine API",
     description=(
-        "Receives geometry constraint JSON from an LLM and returns 3-D coordinates, "
-        "edges and faces for AR rendering in Unity."
+        "Accepts either GeometryInput JSON or an uploaded problem image and returns "
+        "3-D coordinates, edges, and faces for downstream rendering."
     ),
     version="1.0.0",
     docs_url="/docs",
@@ -66,6 +73,53 @@ def solve(input_data: GeometryInput) -> GeometryOutput:
     except Exception as exc:
         logger.exception("Solver error")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/solve-image",
+    response_model=GeometryOutput,
+    summary="Solve a geometry problem from an uploaded image",
+    description=(
+        "Accepts a multipart image upload, runs OCR/LLM analysis, then returns "
+        "the solved 3-D coordinates plus structural edges and faces."
+    ),
+)
+async def solve_image(image: UploadFile = File(...)) -> GeometryOutput:
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
+
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
+    suffix = _resolve_upload_suffix(image)
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(image_bytes)
+            temp_path = temp_file.name
+        return backend_pipeline.solve_image(temp_path)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Image solve error")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        await image.close()
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+
+
+def _resolve_upload_suffix(image: UploadFile) -> str:
+    filename = image.filename or ""
+    suffix = Path(filename).suffix
+    if suffix:
+        return suffix
+    guessed = mimetypes.guess_extension(image.content_type or "")
+    return guessed or ".png"
 
 
 @app.exception_handler(Exception)

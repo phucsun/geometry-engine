@@ -246,6 +246,30 @@ class TestPyramidSABCD:
         assert result["violations"] == [], result["violations"]
 
 
+class TestPyramidSABCDWithApexConstraint:
+    BASE = {
+        "points": ["A", "B", "C", "D", "S", "J"],
+        "constraints": [
+            {"type": "square", "points": ["A", "B", "C", "D"]},
+            {"type": "apex", "points": ["S", "A", "B", "C", "D"]},
+            {"type": "midpoint", "point": "J", "segment": ["S", "D"]},
+            {"type": "equilateral_triangle", "points": ["S", "A", "B"]},
+            {"type": "right_angle", "points": ["S", "A", "D"]},
+        ],
+        "side_length": 1.0,
+    }
+
+    def test_no_violations(self):
+        result = solve(self.BASE)
+        assert result["violations"] == [], result["violations"]
+
+    def test_equilateral_and_right_angle_hold(self):
+        p = pts(self.BASE)
+        assert abs(d(p["S"], p["A"]) - d(p["A"], p["B"])) < EPS
+        assert abs(d(p["S"], p["B"]) - d(p["A"], p["B"])) < EPS
+        assert abs(dot_angle(p["S"], p["A"], p["D"])) < EPS
+
+
 # ── Regular tetrahedron ───────────────────────────────────────────────────────
 
 class TestRegularTetrahedron:
